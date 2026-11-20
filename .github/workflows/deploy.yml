@@ -1,0 +1,103 @@
+name: deploy
+
+# Every push to main rebuilds and redeploys the whole platform from code.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["evidence/**", "**/*.md", "architecture/**", "docs/**"]   # docs-only commits don't redeploy
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false      # never cancel a CloudFormation update halfway
+
+env:
+  AWS_REGION: ap-southeast-1   # A3: Singapore (WAF for CloudFront must still live in us-east-1)
+  STACK: exam-platform
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Lint CloudFormation + Python
+        run: |
+          pip install -q cfn-lint pyflakes
+          cfn-lint infra/template.yaml
+          pyflakes app/api/app.py
+
+  # Skip deploying (instead of failing) when no AWS credentials are configured
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      has_creds: ${{ steps.check.outputs.has_creds }}
+    steps:
+      - id: check
+        env:
+          KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: echo "has_creds=$([ -n "$KEY" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [validate, gate]
+    if: needs.gate.outputs.has_creds == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75           # first deploy (RDS Multi-AZ + CloudFront) takes ~25-35 min
+    steps:
+      - uses: actions/checkout@v4
+
+      # Learner Lab gives temporary credentials: paste fresh ones into the repo
+      # secrets each time you start the lab (AWS Details -> AWS CLI).
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure artifact bucket
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          echo "ARTIFACT_BUCKET=${STACK}-artifacts-${ACCOUNT}" >> "$GITHUB_ENV"
+          aws s3api head-bucket --bucket "${STACK}-artifacts-${ACCOUNT}" 2>/dev/null \
+            || aws s3 mb "s3://${STACK}-artifacts-${ACCOUNT}"
+
+      - name: Build + upload API package (versioned by commit SHA)
+        run: |
+          # instances have no NAT/internet, so ship arm64 wheels inside the package
+          pip download -q -r app/api/requirements.txt -d app/api/wheels \
+            --platform manylinux2014_aarch64 --python-version 3.9 --only-binary=:all:
+          cd app/api && zip -qr ../../api.zip . && cd ../..
+          aws s3 cp api.zip "s3://${ARTIFACT_BUCKET}/app/${GITHUB_SHA}/api.zip"
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK" \
+            --template-file infra/template.yaml \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ArtifactBucket="$ARTIFACT_BUCKET" \
+              AppVersion="$GITHUB_SHA" \
+              TutorEmail="${{ vars.TUTOR_EMAIL }}" \
+              EnableWaf="${{ vars.ENABLE_WAF || 'false' }}" \
+              EnableCognito="${{ vars.ENABLE_COGNITO || 'false' }}"
+
+      - name: Publish frontend
+        run: |
+          out() { aws cloudformation describe-stacks --stack-name "$STACK" \
+                  --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          aws s3 sync frontend/ "s3://$(out FrontendBucketName)/" --delete
+          aws cloudfront create-invalidation --distribution-id "$(out DistributionId)" --paths "/*" > /dev/null
+          echo "### Live at $(out AppUrl)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+                --query "Stacks[0].Outputs[?OutputKey=='AppUrl'].OutputValue" --output text)
+          for i in $(seq 1 20); do
+            curl -fsS "$URL/api/health" && exit 0
+            sleep 15
+          done
+          echo "API never became healthy" && exit 1

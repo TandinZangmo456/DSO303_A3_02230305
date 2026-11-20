@@ -1,0 +1,8 @@
+api.zip
+*.pem
+.env
+.aws/
+__pycache__/
+*.pyc
+.venv/
+RUN-GUIDE.md

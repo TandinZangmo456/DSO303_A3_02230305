@@ -1,0 +1,822 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DSO303 A3 - Online exam & assignment platform (8,000 students), cost-optimised for ap-southeast-1.
+  Two-AZ VPC with no NAT (VPC endpoints), CloudFront + optional WAF, ALB + Graviton Auto Scaling API
+  (scheduled exam scale-out), ElastiCache Valkey cache-aside, RDS MySQL Multi-AZ,
+  DynamoDB autosave, S3 uploads with lifecycle, SQS + Lambda async workers, SNS email.
+  Built for AWS Academy Learner Lab (uses the pre-made LabRole / LabInstanceProfile).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: exam-platform
+    AllowedPattern: "[a-z0-9-]+"
+  ArtifactBucket:
+    Type: String
+    Description: Bucket holding the API zip (created by the pipeline)
+  AppVersion:
+    Type: String
+    Description: Git commit SHA of the API build. Changing it rolls the EC2 fleet.
+  TutorEmail:
+    Type: String
+    Default: ""
+    Description: Email subscribed to "new submission" notifications (confirm the email AWS sends you)
+  InstanceType:
+    Type: String
+    Default: t4g.small          # Graviton (arm64), covered by a 1-yr Compute Savings Plan
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.small       # covered by a 1-yr RDS Reserved Instance
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+  LabInstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Instance profile for the API servers (AWS Academy pre-made one by default)
+  LambdaRoleName:
+    Type: String
+    Default: LabRole
+    Description: Execution role for the Lambda workers (AWS Academy pre-made one by default)
+  EnableWaf:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  EnableCognito:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  ExamPeriod:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true for exam weeks - turns on the scheduled scale-out to 4 instances
+
+Conditions:
+  HasTutorEmail: !Not [!Equals [!Ref TutorEmail, ""]]
+  UseWaf: !Equals [!Ref EnableWaf, "true"]
+  UseCognito: !Equals [!Ref EnableCognito, "true"]
+  IsExamPeriod: !Equals [!Ref ExamPeriod, "true"]
+
+Resources:
+  # ------------------------------------------------------------------ Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref InternetGateway }
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-public-b" }]
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-a" }]
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-app-b" }]
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-data-a" }]
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.22.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-data-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  # A3: NAT gateways removed. App subnets have no internet route at all; AWS APIs are
+  # reached through the S3/DynamoDB gateway endpoints and the interface endpoints below.
+
+  AppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  AppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  AppAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref AppRouteTableA }
+  AppAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref AppRouteTableB }
+
+  # Data subnets have NO route to the internet at all
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  DataAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetA, RouteTableId: !Ref DataRouteTable }
+  DataAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetB, RouteTableId: !Ref DataRouteTable }
+
+  # Free gateway endpoints: S3 + DynamoDB traffic stays on the AWS network (no NAT cost)
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRouteTableA, !Ref AppRouteTableB]
+  DynamoEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref AppRouteTableA, !Ref AppRouteTableB]
+
+  # Interface endpoints (one ENI per AZ) for the AWS APIs the instances call
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from the API instances to VPC interface endpoints
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref AppSecurityGroup }
+  SqsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.sqs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  SecretsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref AppSubnetA, !Ref AppSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # ------------------------------------------------------------------ Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from CloudFront/internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API instances - only from the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - only from API instances
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSecurityGroup }
+
+  # ------------------------------------------------------------------ Secrets + database
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"examadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: "\"@/\\'`"
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private data subnets in two AZs
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete          # lab only - production would use Snapshot
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      MultiAZ: true                 # synchronous standby in the second AZ
+      StorageEncrypted: true        # KMS encryption at rest
+      BackupRetentionPeriod: 7      # enables point-in-time restore (~5 min granularity)
+      DBName: examdb
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      DeletionProtection: false
+
+  AnswersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-answers"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: attemptId, AttributeType: S }
+        - { AttributeName: questionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: attemptId, KeyType: HASH }
+        - { AttributeName: questionId, KeyType: RANGE }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  # ------------------------------------------------------------------ Storage
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: UploadQueuePolicy
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-uploads-${AWS::AccountId}"
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: aws:kms }
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST, PUT]
+            AllowedOrigins: ["*"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: keep-5-years
+            Status: Enabled
+            Transitions:
+              - { StorageClass: STANDARD_IA, TransitionInDays: 30 }
+              - { StorageClass: DEEP_ARCHIVE, TransitionInDays: 180 }
+            ExpirationInDays: 1825
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt UploadEventsQueue.Arn
+            Filter:
+              S3Key:
+                Rules: [{ Name: prefix, Value: assignments/ }]
+
+  UploadBucketTlsOnly:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt UploadBucket.Arn, !Sub "${UploadBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOnly
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ------------------------------------------------------------------ Async processing
+  UploadEventsDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  UploadEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt UploadEventsDlq.Arn, maxReceiveCount: 3 }
+  UploadQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref UploadEventsQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt UploadEventsQueue.Arn
+            Condition:
+              ArnLike: { aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-uploads-${AWS::AccountId}" }
+
+  MarkingDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  MarkingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 60
+      RedrivePolicy: { deadLetterTargetArn: !GetAtt MarkingDlq.Arn, maxReceiveCount: 3 }
+
+  TutorTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-tutor-notifications"
+      KmsMasterKeyId: alias/aws/sns
+  TutorSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTutorEmail
+    Properties: { TopicArn: !Ref TutorTopic, Protocol: email, Endpoint: !Ref TutorEmail }
+
+  NotifyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-notify-tutor"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 10
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LambdaRoleName}"
+      Environment: { Variables: { TOPIC_ARN: !Ref TutorTopic } }
+      Code:
+        ZipFile: |
+          # S3 upload event (via SQS) -> email the tutor through SNS
+          import json, os, urllib.parse, boto3
+          sns = boto3.client("sns")
+
+          def handler(event, context):
+              for msg in event["Records"]:
+                  body = json.loads(msg["body"])
+                  for rec in body.get("Records", []):   # S3 "TestEvent" has no Records
+                      key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])
+                      size_mb = rec["s3"]["object"].get("size", 0) / 1048576
+                      # key = assignments/<assignmentId>/<studentId>/<filename>
+                      parts = key.split("/")
+                      assignment, student, fname = (parts + ["?"] * 4)[1:4]
+                      text = (f"New submission for assignment {assignment}\n"
+                              f"Student: {student}\nFile: {fname} ({size_mb:.1f} MB)\n"
+                              f"Stored at s3://{rec['s3']['bucket']['name']}/{key}")
+                      sns.publish(TopicArn=os.environ["TOPIC_ARN"],
+                                  Subject=f"New submission: {assignment}", Message=text)
+                      print(json.dumps({"notified": key}))
+              return {"ok": True}
+
+  NotifyMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt UploadEventsQueue.Arn
+      FunctionName: !Ref NotifyFunction
+      BatchSize: 10
+
+  MarkingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-auto-mark"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 30
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${LambdaRoleName}"
+      Environment: { Variables: { ANSWERS_TABLE: !Ref AnswersTable } }
+      Code:
+        ZipFile: |
+          # Exam submitted -> auto-mark MCQs from the saved answers -> store result
+          import json, os, time, boto3
+          from boto3.dynamodb.conditions import Key
+          table = boto3.resource("dynamodb").Table(os.environ["ANSWERS_TABLE"])
+
+          def handler(event, context):
+              for msg in event["Records"]:
+                  job = json.loads(msg["body"])
+                  items = table.query(KeyConditionExpression=Key("attemptId").eq(job["attemptId"]))["Items"]
+                  answers = {i["questionId"]: i.get("answer") for i in items if not i["questionId"].startswith("#")}
+                  key = job["answerKey"]              # {questionId: correctOption} - MCQs only
+                  score = sum(1 for q, a in key.items() if str(answers.get(q, "")) == str(a))
+                  table.put_item(Item={
+                      "attemptId": job["attemptId"], "questionId": "#RESULT",
+                      "mcqScore": score, "mcqTotal": len(key),
+                      "shortAnswersPending": job.get("shortCount", 0),
+                      "markedAt": int(time.time()), "released": False})
+                  print(json.dumps({"marked": job["attemptId"], "score": score}))
+              return {"ok": True}
+
+  MarkingMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt MarkingQueue.Arn
+      FunctionName: !Ref MarkingFunction
+      BatchSize: 10
+      ScalingConfig: { MaximumConcurrency: 5 }   # caps marking load during exam peak
+
+  # ------------------------------------------------------------------ Compute (API)
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref TargetGroup }]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Name: !Ref LabInstanceProfileName }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${ProjectName}-api" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euxo pipefail
+            dnf install -y python3-pip unzip   # AL2023 repos are served from S3 -> works via the S3 gateway endpoint
+            mkdir -p /opt/app && cd /opt/app
+            aws s3 cp s3://${ArtifactBucket}/app/${AppVersion}/api.zip api.zip
+            unzip -o api.zip
+            # no internet: wheels are vendored into api.zip by the pipeline (pip download --platform manylinux2014_aarch64)
+            pip3 install --no-index --find-links wheels --ignore-installed -r requirements.txt
+            cat > /etc/systemd/system/examapi.service <<EOF
+            [Unit]
+            Description=Exam platform API
+            After=network-online.target
+            [Service]
+            WorkingDirectory=/opt/app
+            Environment=AWS_DEFAULT_REGION=${AWS::Region}
+            Environment=APP_VERSION=${AppVersion}
+            Environment=DB_HOST=${Database.Endpoint.Address}
+            Environment=DB_SECRET_ARN=${DbSecret}
+            Environment=ANSWERS_TABLE=${AnswersTable}
+            Environment=UPLOAD_BUCKET=${UploadBucket}
+            Environment=MARKING_QUEUE_URL=${MarkingQueue}
+            Environment=CACHE_HOST=${Cache.PrimaryEndPoint.Address}
+            ExecStart=/usr/bin/python3 -m gunicorn -w 3 -b 0.0.0.0:8080 app:app
+            Restart=always
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now examapi
+
+  ApiAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:      # a new AppVersion replaces instances one at a time
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT3M
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      MaxSize: "6"
+      DesiredCapacity: "2"
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${ProjectName}-api", PropagateAtLaunch: true }
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ApiAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 50
+
+  # Scheduled scale-out for exam windows (ASG warm-up is 3-5 min, too slow for a 5-min start burst)
+  ExamScaleOut:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: IsExamPeriod
+    Properties:
+      AutoScalingGroupName: !Ref ApiAutoScalingGroup
+      Recurrence: "30 2 * * 1-5"       # 08:30 Bhutan time (UTC+6), 30 min before the first sitting
+      MinSize: 4
+      DesiredCapacity: 4
+  ExamScaleIn:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: IsExamPeriod
+    Properties:
+      AutoScalingGroupName: !Ref ApiAutoScalingGroup
+      Recurrence: "30 12 * * 1-5"      # 18:30 Bhutan time
+      MinSize: 2
+      DesiredCapacity: 2
+
+  # ------------------------------------------------------------------ Cache (fixes the RDS read bottleneck)
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Valkey from the API instances only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSecurityGroup }
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Data subnets in both AZs
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: Cache-aside for exam papers and question banks
+      Engine: valkey
+      CacheNodeType: cache.t4g.micro
+      NumCacheClusters: 2              # primary in one AZ, replica in the other
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      TransitEncryptionEnabled: true
+      AtRestEncryptionEnabled: true
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+
+  # ------------------------------------------------------------------ Logs (30-day retention keeps CloudWatch Logs storage flat)
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/${ProjectName}/api", RetentionInDays: 30 }
+  MarkingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/aws/lambda/${MarkingFunction}", RetentionInDays: 30 }
+  NotifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: { LogGroupName: !Sub "/aws/lambda/${NotifyFunction}", RetentionInDays: 30 }
+
+  # ------------------------------------------------------------------ Edge
+  FrontendOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-oac-${AWS::StackName}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: UseWaf
+    Properties:
+      Scope: CLOUDFRONT                # CLOUDFRONT-scope ACLs must be created in us-east-1 (deploy separately when the stack is in Singapore)
+      DefaultAction: { Allow: {} }
+      VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: !Sub "${ProjectName}-waf" }
+      Rules:
+        - Name: aws-common-rules
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement: { ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: common }
+        - Name: rate-limit-per-ip
+          Priority: 1
+          Action: { Block: {} }
+          # High limit on purpose: a whole campus can share one public IP during an exam
+          Statement: { RateBasedStatement: { Limit: 20000, AggregateKeyType: IP } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ratelimit }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} frontend + /api"
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_All
+        WebACLId: !If [UseWaf, !GetAtt WebAcl.Arn, !Ref AWS::NoValue]
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: api
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig: { OriginProtocolPolicy: http-only, HTTPPort: 80 }
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6        # Managed-CachingOptimized
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader
+
+  # ------------------------------------------------------------------ Authentication (optional in lab)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: UseCognito
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "OFF"
+      Policies: { PasswordPolicy: { MinimumLength: 10, RequireNumbers: true, RequireUppercase: true, RequireLowercase: true, RequireSymbols: false } }
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: UseCognito
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+  StudentsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: UseCognito
+    Properties: { UserPoolId: !Ref UserPool, GroupName: students, Precedence: 3 }
+  TutorsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: UseCognito
+    Properties: { UserPoolId: !Ref UserPool, GroupName: tutors, Precedence: 2 }
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Condition: UseCognito
+    Properties: { UserPoolId: !Ref UserPool, GroupName: admins, Precedence: 1 }
+
+  # ------------------------------------------------------------------ Monitoring
+  Alarm5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-alb-5xx"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  AlarmUnhealthyHosts:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-unhealthy-api"
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+  AlarmDlq:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-dlq-not-empty"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{ Name: QueueName, Value: !GetAtt UploadEventsDlq.QueueName }]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+  AlarmDbCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-rds-cpu"
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions: [{ Name: DBInstanceIdentifier, Value: !Ref Database }]
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+
+Outputs:
+  AppUrl:
+    Value: !Sub "https://${Distribution.DomainName}"
+  AlbDns:
+    Value: !GetAtt LoadBalancer.DNSName
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref Distribution
+  UploadBucketName:
+    Value: !Ref UploadBucket
+  AsgName:
+    Value: !Ref ApiAutoScalingGroup
+  DbInstanceId:
+    Value: !Ref Database
+  AppSubnetA:
+    Value: !Ref AppSubnetA
+  AppSubnetB:
+    Value: !Ref AppSubnetB
+  AzA:
+    Value: !GetAtt AppSubnetA.AvailabilityZone
+  UserPoolId:
+    Condition: UseCognito
+    Value: !Ref UserPool

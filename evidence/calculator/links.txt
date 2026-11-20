@@ -1,0 +1,5 @@
+AWS Pricing Calculator share links (ap-southeast-1, estimate date 20 Nov 2026)
+
+Normal month  ($329.54): https://calculator.aws/#/estimate?id=0e5d0b19169add1da7f5e97aa9c832abd8cacac6
+Exam month    ($400.68): https://calculator.aws/#/estimate?id=f09315d41728e33373dc5162336f3b3267d24835
+Optimisations (before $221.03 / after $150.82): https://calculator.aws/#/estimate?id=09198a2ce3d53ad6fb518815bb1050eae6e44783

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Online Exams & Submissions</title>
+<style>
+  :root { --ink:#1d2433; --muted:#667085; --line:#e4e7ec; --accent:#1f6feb; --ok:#12805c; --bad:#c4320a; }
+  * { box-sizing:border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin:0; color:var(--ink); background:#f7f8fa; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:12px 20px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; flex:1; }
+  .badge { font:12px ui-monospace, monospace; padding:4px 8px; border-radius:6px; background:#eef4ff; }
+  main { max-width:860px; margin:20px auto; padding:0 16px; display:grid; gap:16px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  h2 { font-size:16px; margin:0 0 12px; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:14px; }
+  button.secondary { background:#fff; color:var(--accent); border:1px solid var(--accent); }
+  input, select, textarea { font:inherit; padding:7px 9px; border:1px solid var(--line); border-radius:6px; }
+  textarea { width:100%; }
+  .q { border-top:1px solid var(--line); padding:12px 0; }
+  .muted { color:var(--muted); font-size:13px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  .hidden { display:none; }
+  pre { background:#f2f4f7; padding:10px; border-radius:6px; overflow:auto; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Online Exams &amp; Submissions</h1>
+  <label>Role
+    <select id="role">
+      <option value="student">Student</option>
+      <option value="tutor">Tutor</option>
+    </select>
+  </label>
+  <input id="studentId" value="02230299" size="10" title="Student ID">
+  <span class="badge" id="served">served by: …</span>
+</header>
+
+<main>
+  <!-- STUDENT -->
+  <section id="student-exams">
+    <h2>Exams</h2>
+    <div id="examList" class="muted">Loading…</div>
+  </section>
+
+  <section id="exam" class="hidden">
+    <h2 id="examTitle"></h2>
+    <div class="row">
+      <span>Time left: <b id="timer">--:--</b></span>
+      <span class="muted" id="saveStatus">Not saved yet</span>
+    </div>
+    <div id="questions"></div>
+    <div class="row">
+      <button id="saveNow" class="secondary">Save now</button>
+      <button id="submitExam">Submit exam</button>
+    </div>
+    <div id="result" class="muted"></div>
+  </section>
+
+  <section id="upload">
+    <h2>Submit an assignment (PDF or ZIP, max 50 MB)</h2>
+    <div class="row">
+      <input id="assignmentId" value="A1" size="6" title="Assignment ID">
+      <input type="file" id="file" accept=".pdf,.zip">
+      <button id="uploadBtn">Upload</button>
+    </div>
+    <div id="uploadStatus" class="muted"></div>
+  </section>
+
+  <!-- TUTOR -->
+  <section id="tutor" class="hidden">
+    <h2>Create exam</h2>
+    <textarea id="examJson" rows="10"></textarea>
+    <div class="row"><button id="createExam">Create</button><span id="createStatus" class="muted"></span></div>
+    <h2 style="margin-top:18px">Submissions</h2>
+    <div class="row"><input id="tutorAssignment" value="A1" size="6"><button id="loadSubs" class="secondary">Load</button></div>
+    <pre id="subs">[]</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const role = () => $("role").value;
+const api = (path, opts = {}) => fetch("/api" + path, {
+  ...opts,
+  headers: { "Content-Type": "application/json", "X-Demo-Role": role(), ...(opts.headers || {}) },
+}).then(async r => { const b = await r.json().catch(() => ({})); if (!r.ok) throw new Error(b.error || r.status); return b; });
+
+/* ---- live "served by" badge: watch it flip AZs during the failure demo ---- */
+async function ping() {
+  try { const h = await api("/health"); $("served").textContent = `served by: ${h.az} · ${h.instance} · v${String(h.version).slice(0,7)}`; $("served").className = "badge"; }
+  catch { $("served").textContent = "API unreachable"; $("served").className = "badge bad"; }
+}
+setInterval(ping, 5000); ping();
+
+/* ---- role switch ---- */
+$("role").onchange = () => {
+  const tutor = role() === "tutor";
+  for (const id of ["student-exams", "upload"]) $(id).classList.toggle("hidden", tutor);
+  $("exam").classList.add("hidden");
+  $("tutor").classList.toggle("hidden", !tutor);
+};
+
+/* ---- exams ---- */
+async function loadExams() {
+  try {
+    const exams = await api("/exams");
+    $("examList").innerHTML = exams.map(e =>
+      `<div class="row"><b>${e.title}</b><span class="muted">${e.duration_minutes} min</span>
+       <button data-id="${e.id}">Open</button></div>`).join("") || "No exams yet.";
+    $("examList").querySelectorAll("button").forEach(b => b.onclick = () => openExam(b.dataset.id));
+  } catch (e) { $("examList").textContent = "Could not load exams: " + e.message; }
+}
+
+let attemptId = null, deadline = null, dirty = false, saveTimer = null, tick = null;
+
+async function openExam(id) {
+  const exam = await api("/exams/" + id);
+  const att = await api(`/exams/${id}/attempts`, { method: "POST", body: JSON.stringify({ studentId: $("studentId").value }) });
+  attemptId = att.attemptId; deadline = new Date(att.deadline);
+  $("examTitle").textContent = exam.title + (att.resumed ? " (resumed)" : "");
+  $("questions").innerHTML = exam.questions.map((q, i) => `
+    <div class="q"><div><b>Q${i + 1}.</b> ${q.text}</div>
+    ${q.type === "mcq"
+      ? q.options.map(o => `<label class="row"><input type="radio" name="${q.id}" value="${o}"> ${o}</label>`).join("")
+      : `<textarea name="${q.id}" rows="3"></textarea>`}</div>`).join("");
+  // restore anything already saved (refresh, or a different instance/AZ after failover)
+  const saved = await api(`/attempts/${attemptId}/answers`);
+  for (const [qid, val] of Object.entries(saved)) {
+    const el = document.querySelector(`[name="${qid}"][value="${CSS.escape(val)}"]`) || document.querySelector(`textarea[name="${qid}"]`);
+    if (el && el.type === "radio") el.checked = true; else if (el) el.value = val;
+  }
+  $("questions").oninput = () => { dirty = true; };
+  $("exam").classList.remove("hidden"); $("result").textContent = "";
+  clearInterval(saveTimer); clearInterval(tick);
+  saveTimer = setInterval(() => dirty && save(), 30000);   // autosave every 30 s
+  tick = setInterval(updateTimer, 1000); updateTimer();
+}
+
+function collect() {
+  const out = {};
+  $("questions").querySelectorAll("input:checked, textarea").forEach(el => { if (el.value) out[el.name] = el.value; });
+  return out;
+}
+
+async function save() {
+  try {
+    const r = await api(`/attempts/${attemptId}/answers`, { method: "PUT", body: JSON.stringify({ answers: collect() }) });
+    dirty = false;
+    $("saveStatus").innerHTML = `<span class="ok">Saved ${new Date(r.savedAt * 1000).toLocaleTimeString()} via ${r.az}</span>`;
+  } catch (e) { $("saveStatus").innerHTML = `<span class="bad">Save failed (${e.message}) – will retry</span>`; }
+}
+
+function updateTimer() {
+  const s = Math.max(0, Math.floor((deadline - Date.now()) / 1000));
+  $("timer").textContent = `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  if (s === 0) { clearInterval(tick); submitExam(); }
+}
+
+async function submitExam() {
+  await save();
+  clearInterval(saveTimer); clearInterval(tick);
+  await api(`/attempts/${attemptId}/submit`, { method: "POST" });
+  $("result").textContent = "Submitted – marking in background…";
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const r = await fetch(`/api/attempts/${attemptId}/result`).then(r => r.json());
+    if (r.status === "marked") {
+      $("result").innerHTML = `<span class="ok">Auto-marked: ${r.mcqScore}/${r.mcqTotal} MCQ</span> · ${r.shortAnswersPending} short answer(s) waiting for the tutor`;
+      return;
+    }
+  }
+}
+$("saveNow").onclick = save;
+$("submitExam").onclick = submitExam;
+
+/* ---- upload: presigned POST straight to S3 ---- */
+$("uploadBtn").onclick = async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  try {
+    $("uploadStatus").textContent = "Requesting upload URL…";
+    const p = await api("/uploads/presign", { method: "POST", body: JSON.stringify({
+      filename: f.name, size: f.size, assignmentId: $("assignmentId").value, studentId: $("studentId").value }) });
+    const form = new FormData();
+    Object.entries(p.fields).forEach(([k, v]) => form.append(k, v));
+    form.append("file", f);                                  // file must be the last field
+    $("uploadStatus").textContent = `Uploading ${(f.size / 1048576).toFixed(1)} MB directly to S3…`;
+    const r = await fetch(p.url, { method: "POST", body: form });
+    if (!r.ok) throw new Error("S3 said " + r.status);
+    $("uploadStatus").innerHTML = `<span class="ok">Uploaded to ${p.key}. Your tutor has been notified.</span>`;
+  } catch (e) { $("uploadStatus").innerHTML = `<span class="bad">${e.message}</span>`; }
+};
+
+/* ---- tutor ---- */
+$("examJson").value = JSON.stringify({
+  title: "Week 10 Quiz", durationMinutes: 15,
+  questions: [
+    { id: "q1", type: "mcq", text: "Which service queues work for async processing?", options: ["SQS", "EBS", "Route 53"], answer: "SQS" },
+    { id: "q2", type: "short", text: "Explain RPO in your own words." }
+  ]
+}, null, 2);
+$("createExam").onclick = async () => {
+  try { const r = await api("/exams", { method: "POST", body: $("examJson").value }); $("createStatus").textContent = "Created " + r.id; loadExams(); }
+  catch (e) { $("createStatus").textContent = e.message; }
+};
+$("loadSubs").onclick = async () => {
+  try { $("subs").textContent = JSON.stringify(await api("/submissions?assignmentId=" + $("tutorAssignment").value), null, 2); }
+  catch (e) { $("subs").textContent = e.message; }
+};
+
+loadExams();
+</script>
+</body>
+</html>
