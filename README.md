@@ -59,4 +59,3 @@ infra/          template.yaml (updated CloudFormation, cfn-lint clean), failure-
 evidence/       calculator/ screenshots + links, lab/ load & failure test screenshots
 app/ frontend/ scripts/ .github/   carried over from A2 (CI now vendors arm64 wheels, region ap-southeast-1)
 ```
-# DSO303_A3_02230305
